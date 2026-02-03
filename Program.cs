@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright 2025 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,18 +16,29 @@
 
 using Google.GenAI;
 using Google.GenAI.Types;
-using System.Collections.Concurrent;
-using NAudio.Wave;
 using Microsoft.Extensions.Configuration;
+using NAudio.Wave;
+using Spectre.Console;
+using System.Collections.Concurrent;
 
 const int SampleRate = 24000;
 const int Channels = 1;
 const int BitsPerSample = 16;
 
-Console.WriteLine("===========================================");
-Console.WriteLine("   C# GenAI Live Audio Voice Bot Console");
-Console.WriteLine("===========================================");
-Console.WriteLine();
+// Enable UTF-8 output for emoji support
+Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+// Status tracking for animations
+var currentStatus = new StatusTracker();
+
+// Beautiful header
+AnsiConsole.Write(
+    new FigletText("Voice Agent")
+        .Centered()
+        .Color(Color.Cyan1));
+
+AnsiConsole.Write(new Rule("[cyan]C# GenAI Live Audio Voice Bot[/]").RuleStyle("blue"));
+AnsiConsole.WriteLine();
 
 bool isVertex = args.Contains("--vertex", StringComparer.OrdinalIgnoreCase);
 string model;
@@ -38,7 +49,7 @@ var configuration = new ConfigurationBuilder().AddUserSecrets<Program>().Build()
 
 if (isVertex)
 {
-    Console.WriteLine("Running in Vertex AI mode.");
+    AnsiConsole.MarkupLine("☁️ [blue]Running in Vertex AI mode[/]");
     string project = configuration["GOOGLE_CLOUD_PROJECT"] ??
                      throw new ArgumentNullException("GOOGLE_CLOUD_PROJECT not set for Vertex AI.");
     string location = System.Environment.GetEnvironmentVariable("GOOGLE_CLOUD_LOCATION") ?? "us-central1";
@@ -48,7 +59,7 @@ if (isVertex)
 }
 else
 {
-    Console.WriteLine("Running in Gemini API mode.");
+    AnsiConsole.MarkupLine("✨ [magenta]Running in Gemini API mode[/]");
     string apiKey = configuration["GOOGLE_API_KEY"] ??
                     throw new ArgumentNullException("GOOGLE_API_KEY not set for Gemini API.");
     client = new Client(apiKey: apiKey);
@@ -56,8 +67,8 @@ else
     mimeType = "audio/pcm";
 }
 
-Console.WriteLine($"Model: {model}");
-Console.WriteLine();
+AnsiConsole.MarkupLine($"🤖 [grey]Model:[/] [yellow]{model}[/]");
+AnsiConsole.WriteLine();
 
 var config = new LiveConnectConfig
 {
@@ -68,15 +79,33 @@ var config = new LiveConnectConfig
         AutomaticActivityDetection = new AutomaticActivityDetection
         {
             Disabled = true,
-        }
+        },
+
     },
-    SystemInstruction = new Content() { Parts = [new Part() { Text = "You are a helpful assistant named Aarvi." }] }
+    SystemInstruction = new Content() { Parts = [new Part() { Text = "You are a helpful assistant named Aarvi." }] },
+    Tools = new List<Tool>
+    {
+        new Tool()
+        {
+            GoogleSearch = new GoogleSearch(),
+        },
+    },
+    OutputAudioTranscription = new AudioTranscriptionConfig(),
+    InputAudioTranscription = new AudioTranscriptionConfig()
+
 };
 
-Console.WriteLine("Connecting to Gemini Live session...");
+await AnsiConsole.Status()
+    .Spinner(Spinner.Known.Dots)
+    .SpinnerStyle(Style.Parse("green"))
+    .StartAsync("Connecting to Gemini Live session...", async ctx =>
+    {
+        await Task.Delay(500); // Brief visual delay for the spinner
+    });
+
+AnsiConsole.MarkupLine("[green]✅ Connected to Gemini Live session![/]");
 var geminiLiveSession = await client.Live.ConnectAsync(model, config);
-Console.WriteLine("Connected to Gemini Live session.");
-Console.WriteLine();
+AnsiConsole.WriteLine();
 
 var cts = new CancellationTokenSource();
 var audioPlaybackQueue = new BlockingCollection<byte[]>();
@@ -84,13 +113,58 @@ var audioPlaybackQueue = new BlockingCollection<byte[]>();
 Console.CancelKeyPress += (sender, e) =>
 {
     e.Cancel = true;
-    Console.WriteLine("\nShutting down...");
+    currentStatus.Stop();
+    AnsiConsole.MarkupLine("\n👋 [yellow]Shutting down...[/]");
     cts.Cancel();
 };
 
-Console.WriteLine("Press ENTER to start/stop speaking, or Ctrl+C to exit.");
-Console.WriteLine("===========================================");
-Console.WriteLine();
+// Instructions panel
+var instructionPanel = new Panel(
+    new Markup("[white]Press [green]ENTER[/] to start/stop speaking\nPress [red]Ctrl+C[/] to exit[/]"))
+    .Header("[cyan]Instructions[/]")
+    .BorderColor(Color.Cyan1)
+    .Padding(1, 0);
+AnsiConsole.Write(instructionPanel);
+AnsiConsole.WriteLine();
+
+AnsiConsole.Write(new Rule().RuleStyle("grey"));
+AnsiConsole.WriteLine();
+
+// Status animation task
+var animationTask = Task.Run(async () =>
+{
+    // Using direct Unicode emoji characters for better compatibility
+    var userSpeakingFrames = new[] { "🎤", "🎙️", "🎤", "🎵" };
+    var agentSpeakingFrames = new[] { "🤖", "💬", "🤖", "💭" };
+    var waitingFrames = new[] { "⏳", "⌛" };
+    int frameIndex = 0;
+
+    while (!cts.Token.IsCancellationRequested)
+    {
+        try
+        {
+            if (currentStatus.IsUserSpeaking)
+            {
+                AnsiConsole.Markup($"\r[red]{userSpeakingFrames[frameIndex % userSpeakingFrames.Length]} Recording...[/]    ");
+            }
+            else if (currentStatus.IsWaitingForAgent)
+            {
+                AnsiConsole.Markup($"\r[yellow]{waitingFrames[frameIndex % waitingFrames.Length]} Waiting for Aarvi...[/]    ");
+            }
+            else if (currentStatus.IsAgentSpeaking)
+            {
+                AnsiConsole.Markup($"\r[cyan]{agentSpeakingFrames[frameIndex % agentSpeakingFrames.Length]} Aarvi is speaking...[/]    ");
+            }
+
+            frameIndex++;
+            await Task.Delay(300, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+    }
+}, cts.Token);
 
 // Audio playback task
 var playbackTask = Task.Run(() =>
@@ -132,6 +206,7 @@ var receiveTask = Task.Run(async () =>
                 var content = serverMsg.ServerContent;
                 if (content.ModelTurn?.Parts != null)
                 {
+                    currentStatus.SetAgentSpeaking();
                     foreach (var part in content.ModelTurn.Parts)
                     {
                         if (part.InlineData?.MimeType?.StartsWith("audio/") == true && part.InlineData.Data != null)
@@ -143,7 +218,8 @@ var receiveTask = Task.Run(async () =>
 
                 if (content.TurnComplete == true)
                 {
-                    Console.WriteLine("[Aarvi finished speaking. Your turn.]");
+                    currentStatus.Stop();
+                    AnsiConsole.MarkupLine("\r[green]✅ Aarvi finished speaking. Your turn![/]                    ");
                 }
             }
         }
@@ -154,7 +230,7 @@ var receiveTask = Task.Run(async () =>
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Error receiving from Gemini: {ex.Message}");
+        AnsiConsole.MarkupLine($"\r[red]❌ Error receiving from Gemini: {ex.Message}[/]");
     }
 }, cts.Token);
 
@@ -175,8 +251,8 @@ try
                 {
                     // Start recording
                     isRecording = true;
-                    Console.WriteLine();
-                    Console.WriteLine("[Recording... Press ENTER to stop]");
+                    currentStatus.SetUserSpeaking();
+                    AnsiConsole.WriteLine();
 
                     // Signal start of turn
                     try
@@ -186,7 +262,7 @@ try
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Error sending activity start: {ex.Message}");
+                        AnsiConsole.MarkupLine($"\r[red]❌ Error sending activity start: {ex.Message}[/]");
                     }
 
                     waveIn = new WaveInEvent
@@ -216,7 +292,7 @@ try
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine($"Error sending audio: {ex.Message}");
+                                AnsiConsole.MarkupLine($"\r[red]❌ Error sending audio: {ex.Message}[/]");
                             }
                         }
                     };
@@ -227,7 +303,8 @@ try
                 {
                     // Stop recording
                     isRecording = false;
-                    Console.WriteLine("[Stopped recording. Processing...]");
+                    currentStatus.SetWaitingForAgent();
+                    AnsiConsole.MarkupLine("\r[grey]⏹️ Stopped recording. Processing...[/]                    ");
 
                     waveIn?.StopRecording();
                     waveIn?.Dispose();
@@ -241,10 +318,8 @@ try
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Error sending turn complete: {ex.Message}");
+                        AnsiConsole.MarkupLine($"\r[red]❌ Error sending turn complete: {ex.Message}[/]");
                     }
-
-                    Console.WriteLine("[Waiting for Aarvi's response...]");
                 }
             }
         }
@@ -262,14 +337,24 @@ finally
     waveIn?.Dispose();
 
     audioPlaybackQueue.CompleteAdding();
+    currentStatus.Stop();
 
-    Console.WriteLine("Closing Gemini session...");
-    await geminiLiveSession.CloseAsync();
-    Console.WriteLine("Gemini session closed.");
+    AnsiConsole.WriteLine();
+    AnsiConsole.Write(new Rule("[yellow]Closing Session[/]").RuleStyle("yellow"));
+
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.Dots)
+        .SpinnerStyle(Style.Parse("yellow"))
+        .StartAsync("Closing Gemini session...", async ctx =>
+        {
+            await geminiLiveSession.CloseAsync();
+        });
+
+    AnsiConsole.MarkupLine("[green]✅ Gemini session closed.[/]");
 
     try
     {
-        await Task.WhenAll(receiveTask, playbackTask);
+        await Task.WhenAll(receiveTask, playbackTask, animationTask);
     }
     catch
     {
@@ -277,4 +362,41 @@ finally
     }
 }
 
-Console.WriteLine("Goodbye!");
+AnsiConsole.WriteLine();
+AnsiConsole.MarkupLine("[cyan]👋 Goodbye![/]");
+
+// Helper class to track current status for animations
+class StatusTracker
+{
+    public bool IsUserSpeaking { get; private set; }
+    public bool IsAgentSpeaking { get; private set; }
+    public bool IsWaitingForAgent { get; private set; }
+
+    public void SetUserSpeaking()
+    {
+        IsUserSpeaking = true;
+        IsAgentSpeaking = false;
+        IsWaitingForAgent = false;
+    }
+
+    public void SetAgentSpeaking()
+    {
+        IsUserSpeaking = false;
+        IsAgentSpeaking = true;
+        IsWaitingForAgent = false;
+    }
+
+    public void SetWaitingForAgent()
+    {
+        IsUserSpeaking = false;
+        IsAgentSpeaking = false;
+        IsWaitingForAgent = true;
+    }
+
+    public void Stop()
+    {
+        IsUserSpeaking = false;
+        IsAgentSpeaking = false;
+        IsWaitingForAgent = false;
+    }
+}
